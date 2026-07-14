@@ -1,0 +1,16 @@
+[package]
+name = "tbtool-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tbtool"
+path = "src/main.rs"
+
+[dependencies]
+tbtool-core = { path = "../tbtool-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

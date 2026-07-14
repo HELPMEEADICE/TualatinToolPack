@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Bundled resources and tools
+/data/
+/List/
+/skin/
+/tools/
+*.exe
+Config.ini
+
+# IDA Pro analysis databases
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Editor and Windows temporary files
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
