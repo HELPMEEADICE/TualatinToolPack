@@ -29,3 +29,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Optimize the distributable executable for size. Debug information remains
+# available in the development profile, so release builds contain only code
+# that is required at runtime.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
