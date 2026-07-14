@@ -14,3 +14,6 @@ tbtool-core = { path = "../tbtool-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

@@ -35,15 +35,15 @@ use windows_sys::Win32::{
             CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
             DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
             GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HMENU, HTCAPTION,
-            HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
-            MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, MoveWindow, PostMessageW,
-            PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW,
-            SendMessageW, SetCursor, SetWindowLongPtrW, ShowWindow, TranslateMessage, WM_APP,
-            WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-            WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-            WM_PAINT, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW,
-            WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, LoadCursorW, LoadIconW,
+            MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW,
+            MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
+            SW_MINIMIZE, SW_SHOW, SendMessageW, SetCursor, SetWindowLongPtrW, ShowWindow,
+            TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+            WM_GETMINMAXINFO, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+            WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_SETICON, WM_SIZE, WNDCLASSW,
+            WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
+            WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -1137,10 +1137,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let instance = GetModuleHandleW(null());
         let class_name = wide(CLASS_NAME);
+        let app_icon = LoadIconW(instance, 1usize as *const u16);
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
+            hIcon: app_icon,
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszClassName: class_name.as_ptr(),
@@ -1174,6 +1176,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if hwnd.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, app_icon as isize);
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, app_icon as isize);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
         PostMessageW(hwnd, WM_LOAD_HARDWARE, 0, 0);
