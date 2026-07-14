@@ -2,14 +2,15 @@ use std::{
     collections::HashMap,
     ffi::c_void,
     fs,
-    mem::zeroed,
+    io::Cursor,
+    mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
 };
 
 use tbtool_core::{
-    HardwareCategory, HardwareSnapshot, ToolCatalog, ToolLauncher, ToolTarget,
-    collect_hardware_snapshot,
+    HardwareCategory, HardwareSnapshot, IniDocument, SkinPackage, ToolCatalog, ToolLauncher,
+    ToolTarget, collect_hardware_snapshot,
 };
 use windows_sys::Win32::{
     Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
@@ -22,6 +23,10 @@ use windows_sys::Win32::{
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
+        Controls::Dialogs::{
+            GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+            OPENFILENAMEW,
+        },
         HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
             SetProcessDpiAwarenessContext,
@@ -56,6 +61,10 @@ const GRID_TOP: i32 = 56;
 const GRID_CELL_WIDTH: i32 = 75;
 const GRID_CELL_HEIGHT: i32 = 80;
 const GRID_COLUMNS: usize = 10;
+const MENU_LEFT: i32 = 891;
+const SETTINGS_LEFT: i32 = 216;
+const SETTINGS_TOP: i32 = 60;
+const SETTINGS_ROW_HEIGHT: i32 = 30;
 const WM_LOAD_HARDWARE: u32 = WM_APP + 1;
 const IDYES: i32 = 6;
 
@@ -210,6 +219,8 @@ enum PageKind {
     Settings,
 }
 
+static SETTINGS_PAGE: PageKind = PageKind::Settings;
+
 struct SidebarItem {
     label: &'static str,
     page: PageKind,
@@ -219,8 +230,38 @@ struct SidebarItem {
 enum HitTarget {
     Sidebar(usize),
     Tool(usize),
+    Menu,
+    Setting(SettingAction),
     Minimize,
     Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingAction {
+    SilentHardware,
+    ChooseSkin,
+    InternalImageViewer,
+    ToolTips,
+    WindowEffects,
+}
+
+#[derive(Clone, Copy)]
+struct AppSettings {
+    silent_hardware: bool,
+    internal_image_viewer: bool,
+    tool_tips: bool,
+    window_effects: bool,
+}
+
+impl AppSettings {
+    fn from_ini(config: &IniDocument) -> Self {
+        Self {
+            silent_hardware: ini_bool(config, "静默检测硬件信息", false),
+            internal_image_viewer: ini_bool(config, "使用内置图片查看器打开天梯图", true),
+            tool_tips: ini_bool(config, "打开工具时显示提示", true),
+            window_effects: ini_bool(config, "适配窗口动画和阴影特效", true),
+        }
+    }
 }
 
 enum HardwareState {
@@ -229,6 +270,10 @@ enum HardwareState {
 }
 
 struct AppState {
+    root: PathBuf,
+    config_path: PathBuf,
+    config: IniDocument,
+    settings: AppSettings,
     catalog: ToolCatalog,
     launcher: ToolLauncher,
     hwnd: HWND,
@@ -238,12 +283,12 @@ struct AppState {
     icon_cache: HashMap<u64, GdiImage>,
     sidebar: Vec<SidebarItem>,
     active_sidebar: usize,
+    settings_visible: bool,
     visible_tools: Vec<(usize, usize)>,
     selected_tool: Option<usize>,
     hover: Option<HitTarget>,
     status: String,
     hardware: HardwareState,
-    skin_names: Vec<String>,
 }
 
 struct HardwareWindowState {
@@ -258,6 +303,9 @@ impl AppState {
         catalog: ToolCatalog,
         launcher: ToolLauncher,
     ) -> Result<Self, std::io::Error> {
+        let config_path = root.join("Config.ini");
+        let config = IniDocument::parse(&fs::read(&config_path)?).map_err(io_error)?;
+        let settings = AppSettings::from_ini(&config);
         let user_skin = root.join("skin/user");
         let background = GdiImage::load(&user_skin.join("默认底图.png"))?;
         let hardware_background = GdiImage::load(&user_skin.join("硬件信息底图.png"))?;
@@ -266,20 +314,11 @@ impl AppState {
             .map(|name| GdiImage::load(&user_skin.join(name)))
             .collect::<Result<Vec<_>, _>>()?;
         let sidebar = build_sidebar(&catalog);
-        let mut skin_names = fs::read_dir(root.join("skin"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("skin"))
-            })
-            .filter_map(|path| {
-                path.file_stem()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .collect::<Vec<_>>();
-        skin_names.sort();
         Ok(Self {
+            root: root.to_path_buf(),
+            config_path,
+            config,
+            settings,
             catalog,
             launcher,
             hwnd: null_mut(),
@@ -289,23 +328,28 @@ impl AppState {
             icon_cache: HashMap::new(),
             sidebar,
             active_sidebar: 0,
+            settings_visible: false,
             visible_tools: Vec::new(),
             selected_tool: None,
             hover: None,
             status: "硬件信息正在读取中…".to_owned(),
             hardware: HardwareState::Loading,
-            skin_names,
         })
     }
 
     fn current_page(&self) -> &PageKind {
-        &self.sidebar[self.active_sidebar].page
+        if self.settings_visible {
+            &SETTINGS_PAGE
+        } else {
+            &self.sidebar[self.active_sidebar].page
+        }
     }
 
     unsafe fn select_sidebar(&mut self, index: usize) {
         if index >= self.sidebar.len() {
             return;
         }
+        self.settings_visible = false;
         self.active_sidebar = index;
         self.selected_tool = None;
         self.visible_tools.clear();
@@ -327,10 +371,16 @@ impl AppState {
                 }
                 self.status = "提示：单击选择工具可查看工具说明，双击可启动工具。".to_owned();
             }
-            PageKind::Settings => {
-                self.status = "选项设置".to_owned();
-            }
+            PageKind::Settings => unreachable!("settings is opened from the title-bar menu"),
         }
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+
+    unsafe fn show_settings(&mut self) {
+        self.settings_visible = true;
+        self.selected_tool = None;
+        self.visible_tools.clear();
+        self.status = "选项设置".to_owned();
         unsafe { InvalidateRect(self.hwnd, null(), 0) };
     }
 
@@ -421,11 +471,26 @@ impl AppState {
         if (931..=970).contains(&x) && (8..=48).contains(&y) {
             return Some(HitTarget::Minimize);
         }
+        if (MENU_LEFT..=930).contains(&x) && (8..=48).contains(&y) {
+            return Some(HitTarget::Menu);
+        }
         if x < SIDEBAR_WIDTH && y >= SIDEBAR_TOP {
             let index = ((y - SIDEBAR_TOP) / SIDEBAR_ROW_HEIGHT) as usize;
             if index < self.sidebar.len() {
                 return Some(HitTarget::Sidebar(index));
             }
+        }
+        if self.settings_visible && x >= SETTINGS_LEFT && y >= SETTINGS_TOP {
+            let index = ((y - SETTINGS_TOP) / SETTINGS_ROW_HEIGHT) as usize;
+            let action = match index {
+                0 => SettingAction::SilentHardware,
+                1 => SettingAction::ChooseSkin,
+                2 => SettingAction::InternalImageViewer,
+                3 => SettingAction::ToolTips,
+                4 => SettingAction::WindowEffects,
+                _ => return None,
+            };
+            return Some(HitTarget::Setting(action));
         }
         if matches!(self.current_page(), PageKind::Tools(_)) && x >= GRID_LEFT && y >= GRID_TOP {
             let column = ((x - GRID_LEFT) / GRID_CELL_WIDTH) as usize;
@@ -448,13 +513,159 @@ impl AppState {
             Some(HitTarget::Minimize) => unsafe {
                 ShowWindow(self.hwnd, SW_MINIMIZE);
             },
+            Some(HitTarget::Menu) => unsafe { self.show_settings() },
             Some(HitTarget::Sidebar(index)) => unsafe { self.select_sidebar(index) },
+            Some(HitTarget::Setting(action)) => unsafe { self.activate_setting(action) },
             Some(HitTarget::Tool(index)) => {
                 self.select_tool(index);
                 unsafe { InvalidateRect(self.hwnd, null(), 0) };
             }
             None => {}
         }
+    }
+
+    unsafe fn activate_setting(&mut self, action: SettingAction) {
+        if action == SettingAction::ChooseSkin {
+            unsafe { self.choose_skin() };
+            return;
+        }
+
+        let (key, current) = match action {
+            SettingAction::SilentHardware => ("静默检测硬件信息", self.settings.silent_hardware),
+            SettingAction::InternalImageViewer => (
+                "使用内置图片查看器打开天梯图",
+                self.settings.internal_image_viewer,
+            ),
+            SettingAction::ToolTips => ("打开工具时显示提示", self.settings.tool_tips),
+            SettingAction::WindowEffects => {
+                ("适配窗口动画和阴影特效", self.settings.window_effects)
+            }
+            SettingAction::ChooseSkin => unreachable!(),
+        };
+        let next = !current;
+        if action == SettingAction::WindowEffects
+            && next
+            && unsafe {
+                message_box(
+                    self.hwnd,
+                    "该功能处于测试阶段，不保证稳定。如果开启后程序出现报错、闪退或无法启动，可删除 Config.ini 恢复默认设置。\r\n\r\n是否确认开启？",
+                    "适配窗口动画和阴影特效 (Beta)",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                )
+            } != IDYES
+        {
+            return;
+        }
+
+        let mut config = self.config.clone();
+        config.set("设置", key, bool_text(next));
+        let result = config
+            .to_bytes()
+            .map_err(io_error)
+            .and_then(|bytes| fs::write(&self.config_path, bytes));
+        if let Err(error) = result {
+            unsafe {
+                message_box(
+                    self.hwnd,
+                    &format!("无法保存选项设置\r\n\r\n{error}"),
+                    "保存失败",
+                    MB_OK | MB_ICONERROR,
+                )
+            };
+            return;
+        }
+
+        self.config = config;
+        match action {
+            SettingAction::SilentHardware => self.settings.silent_hardware = next,
+            SettingAction::InternalImageViewer => self.settings.internal_image_viewer = next,
+            SettingAction::ToolTips => self.settings.tool_tips = next,
+            SettingAction::WindowEffects => self.settings.window_effects = next,
+            SettingAction::ChooseSkin => unreachable!(),
+        }
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+
+    unsafe fn choose_skin(&mut self) {
+        let Some(path) = (unsafe { open_skin_file(self.hwnd, &self.root.join("skin")) }) else {
+            return;
+        };
+        if let Err(error) = self.apply_skin(&path) {
+            unsafe {
+                message_box(
+                    self.hwnd,
+                    &format!("无法应用所选皮肤\r\n\r\n{error}"),
+                    "皮肤加载失败",
+                    MB_OK | MB_ICONERROR,
+                )
+            };
+            return;
+        }
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+
+    fn apply_skin(&mut self, path: &Path) -> Result<(), std::io::Error> {
+        let package = SkinPackage::from_zip(Cursor::new(fs::read(path)?)).map_err(io_error)?;
+        let asset = |name: &'static str| {
+            package
+                .asset(name)
+                .ok_or_else(|| std::io::Error::other(format!("皮肤缺少资源：{name}")))
+        };
+
+        let background = GdiImage::from_bytes(asset("默认底图.png")?)
+            .ok_or_else(|| std::io::Error::other("无法解码皮肤默认底图"))?;
+        let hardware_background = GdiImage::from_bytes(asset("硬件信息底图.png")?)
+            .ok_or_else(|| std::io::Error::other("无法解码皮肤硬件信息底图"))?;
+        let hardware_icons = ["型号信息.png", "系统信息.png", "运行时间.png"]
+            .into_iter()
+            .map(|name| {
+                GdiImage::from_bytes(asset(name)?)
+                    .ok_or_else(|| std::io::Error::other(format!("无法解码皮肤资源：{name}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let user_skin = self.root.join("skin/user");
+        for name in [
+            "默认底图.png",
+            "运行时间.png",
+            "系统信息.png",
+            "硬件信息底图.png",
+            "控制按钮.png",
+            "型号信息.png",
+            "列表按钮.png",
+        ] {
+            fs::write(user_skin.join(name), asset(name)?)?;
+        }
+        fs::write(
+            user_skin.join("Config.ini"),
+            package.config.to_bytes().map_err(io_error)?,
+        )?;
+
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "自定义.skin".to_owned());
+        let skin_name = package
+            .manifest
+            .name
+            .clone()
+            .or_else(|| {
+                path.file_stem()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "自定义".to_owned());
+        let author = package.manifest.author.clone().unwrap_or_default();
+        let mut config = self.config.clone();
+        config.set("皮肤", "文件名", file_name);
+        config.set("皮肤", "皮肤名", skin_name);
+        config.set("皮肤", "作者", author);
+        fs::write(&self.config_path, config.to_bytes().map_err(io_error)?)?;
+
+        self.background = background;
+        self.hardware_background = hardware_background;
+        self.hardware_icons = hardware_icons;
+        self.config = config;
+        Ok(())
     }
 
     unsafe fn mouse_double_click(&mut self, x: i32, y: i32) {
@@ -518,7 +729,9 @@ impl AppState {
                 }
             }
             let mut selection_brush = null_mut();
-            if unsafe { GdipCreateSolidFill(0x20ff_ffff, &mut selection_brush) } == 0 {
+            if !self.settings_visible
+                && unsafe { GdipCreateSolidFill(0x20ff_ffff, &mut selection_brush) } == 0
+            {
                 unsafe {
                     GdipFillRectangleI(
                         graphics,
@@ -645,8 +858,14 @@ impl AppState {
             draw_text(
                 buffer_dc,
                 &self.status,
-                scaled_rect(225, 12, 700, 32, width, height),
+                scaled_rect(225, 12, 660, 32, width, height),
                 DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            draw_text(
+                buffer_dc,
+                "≡",
+                scaled_rect(899, 8, 32, 40, width, height),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
 
@@ -681,7 +900,7 @@ impl AppState {
                 self.paint_hardware(buffer_dc, width, height, nav_font, section_font, small_font)
             },
             PageKind::Settings => unsafe {
-                self.paint_settings(buffer_dc, width, height, nav_font, section_font)
+                self.paint_settings(buffer_dc, width, height, nav_font)
             },
         }
 
@@ -788,45 +1007,37 @@ impl AppState {
         }
     }
 
-    unsafe fn paint_settings(
-        &self,
-        dc: *mut c_void,
-        width: i32,
-        height: i32,
-        font: HGDIOBJ,
-        section_font: HGDIOBJ,
-    ) {
-        let brush = unsafe { CreateSolidBrush(rgb(35, 153, 198)) };
-        let panel = scaled_rect(235, 84, 772, 460, width, height);
+    unsafe fn paint_settings(&self, dc: *mut c_void, width: i32, height: i32, font: HGDIOBJ) {
+        let options = [
+            option_text(self.settings.silent_hardware, "启动时静默检测硬件信息"),
+            "【●】选择皮肤".to_owned(),
+            option_text(
+                self.settings.internal_image_viewer,
+                "使用内置图片查看器打开天梯图",
+            ),
+            option_text(self.settings.tool_tips, "打开工具时显示提示"),
+            option_text(
+                self.settings.window_effects,
+                "适配窗口动画和阴影特效 (Beta)",
+            ),
+        ];
         unsafe {
-            FillRect(dc, &panel, brush);
-            DeleteObject(brush as HGDIOBJ);
-            SelectObject(dc, section_font);
-            draw_text(
-                dc,
-                "选项设置",
-                scaled_rect(260, 105, 300, 36, width, height),
-                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
             SelectObject(dc, font);
-            draw_text(
-                dc,
-                "当前皮肤：经典蓝\r\n\r\n已安装皮肤：",
-                scaled_rect(260, 160, 700, 80, width, height),
-                DT_WORDBREAK | DT_NOPREFIX,
-            );
-            draw_text(
-                dc,
-                &self.skin_names.join("    "),
-                scaled_rect(260, 235, 700, 190, width, height),
-                DT_WORDBREAK | DT_NOPREFIX,
-            );
-            draw_text(
-                dc,
-                "Rust 版会直接使用 skin/user 中由原版解压出的当前皮肤资源。",
-                scaled_rect(260, 470, 700, 30, width, height),
-                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
+            for (index, option) in options.iter().enumerate() {
+                draw_text(
+                    dc,
+                    option,
+                    scaled_rect(
+                        SETTINGS_LEFT,
+                        SETTINGS_TOP + index as i32 * SETTINGS_ROW_HEIGHT,
+                        700,
+                        SETTINGS_ROW_HEIGHT,
+                        width,
+                        height,
+                    ),
+                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
         }
     }
 
@@ -1059,7 +1270,7 @@ unsafe extern "system" fn window_proc(
             unsafe { GetWindowRect(hwnd, &mut window) };
             let (x, y) =
                 unsafe { (*state).logical_point(screen_x - window.left, screen_y - window.top) };
-            if y < 56 && x < 930 {
+            if y < 56 && x < MENU_LEFT {
                 HTCAPTION as LRESULT
             } else {
                 HTCLIENT as LRESULT
@@ -1108,8 +1319,6 @@ fn build_sidebar(catalog: &ToolCatalog) -> Vec<SidebarItem> {
             .into_iter()
             .collect::<Vec<_>>()
     };
-    let mut other = category("其他工具");
-    other.extend(category("游戏工具"));
     vec![
         SidebarItem {
             label: "硬件信息",
@@ -1152,14 +1361,39 @@ fn build_sidebar(catalog: &ToolCatalog) -> Vec<SidebarItem> {
             page: PageKind::Tools(category("烤鸡工具")),
         },
         SidebarItem {
-            label: "其他工具",
-            page: PageKind::Tools(other),
+            label: "游戏工具",
+            page: PageKind::Tools(category("游戏工具")),
         },
         SidebarItem {
-            label: "选项设置",
-            page: PageKind::Settings,
+            label: "其他工具",
+            page: PageKind::Tools(category("其他工具")),
         },
     ]
+}
+
+fn ini_bool(config: &IniDocument, key: &str, default: bool) -> bool {
+    config
+        .get("设置", key)
+        .map(str::trim)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "真" | "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+const fn bool_text(value: bool) -> &'static str {
+    if value { "真" } else { "假" }
+}
+
+fn option_text(enabled: bool, label: &str) -> String {
+    format!("【{}】{label}", if enabled { "●" } else { "  " })
+}
+
+fn io_error(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(error.to_string())
 }
 
 fn hardware_name(
@@ -1480,6 +1714,36 @@ unsafe fn message_box(hwnd: HWND, message: &str, title: &str, style: u32) -> i32
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+unsafe fn open_skin_file(owner: HWND, initial_directory: &Path) -> Option<PathBuf> {
+    let filter = wide("图吧工具箱皮肤 (*.skin)\0*.skin\0所有文件 (*.*)\0*.*\0");
+    let title = wide("选择皮肤");
+    let initial_directory = wide(&initial_directory.to_string_lossy());
+    let extension = wide("skin");
+    let mut file_name = vec![0u16; 32_768];
+    let mut dialog: OPENFILENAMEW = unsafe { zeroed() };
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.nFilterIndex = 1;
+    dialog.lpstrFile = file_name.as_mut_ptr();
+    dialog.nMaxFile = file_name.len() as u32;
+    dialog.lpstrInitialDir = initial_directory.as_ptr();
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    dialog.lpstrDefExt = extension.as_ptr();
+
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let length = file_name
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(file_name.len());
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &file_name[..length],
+    )))
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
