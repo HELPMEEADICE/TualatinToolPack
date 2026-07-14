@@ -34,15 +34,16 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
             DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
-            GetMessageW, GetWindowLongPtrW, GetWindowRect, HMENU, HTCAPTION, HTCLIENT, IDC_ARROW,
-            IDC_HAND, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
-            MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-            SW_MINIMIZE, SW_SHOW, SendMessageW, SetCursor, SetWindowLongPtrW, ShowWindow,
-            TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-            WM_GETMINMAXINFO, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-            WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD,
-            WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_HSCROLL,
-            WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HMENU, HTCAPTION,
+            HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+            MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, MoveWindow, PostMessageW,
+            PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW,
+            SendMessageW, SetCursor, SetWindowLongPtrW, ShowWindow, TranslateMessage, WM_APP,
+            WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+            WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+            WM_PAINT, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW,
+            WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -1150,6 +1151,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let dpi = 96u32;
+        let width = BASE_WIDTH * dpi as i32 / 96;
+        let height = BASE_HEIGHT * dpi as i32 / 96;
+        let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+        let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
         let title = wide(WINDOW_TITLE);
         let state_ptr = state.as_mut() as *mut AppState;
         let hwnd = CreateWindowExW(
@@ -1157,10 +1162,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             class_name.as_ptr(),
             title.as_ptr(),
             WS_POPUP | WS_CLIPCHILDREN,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            BASE_WIDTH * dpi as i32 / 96,
-            BASE_HEIGHT * dpi as i32 / 96,
+            x,
+            y,
+            width,
+            height,
             null_mut(),
             null_mut(),
             instance,
