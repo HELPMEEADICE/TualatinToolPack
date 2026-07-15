@@ -6,6 +6,7 @@ use std::{
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
+    sync::mpsc::Receiver,
 };
 
 use tbtool_core::{
@@ -179,6 +180,8 @@ impl Drop for GdiplusSession {
 struct GdiImage {
     image: *mut GpImage,
     stream: *mut Unknown,
+    width: u32,
+    height: u32,
 }
 
 impl GdiImage {
@@ -194,7 +197,18 @@ impl GdiImage {
             unsafe { ((*(*stream).vtable).release)(stream) };
             return None;
         }
-        Some(Self { image, stream })
+        let mut width = 0;
+        let mut height = 0;
+        unsafe {
+            GdipGetImageWidth(image, &mut width);
+            GdipGetImageHeight(image, &mut height);
+        }
+        Some(Self {
+            image,
+            stream,
+            width,
+            height,
+        })
     }
 
     fn load(path: &Path) -> Result<Self, std::io::Error> {
@@ -290,6 +304,77 @@ struct AppState {
     hover: Option<HitTarget>,
     status: String,
     hardware: HardwareState,
+    hardware_rx: Receiver<HardwareSnapshot>,
+    paint_resources: Option<PaintResources>,
+}
+
+struct PaintResources {
+    dc: *mut c_void,
+    bitmap: HGDIOBJ,
+    old_bitmap: HGDIOBJ,
+    old_font: HGDIOBJ,
+    fallback_brush: HBRUSH,
+    tool_selection_brush: HBRUSH,
+    sidebar_selection_brush: *mut GpBrush,
+    title_font: HGDIOBJ,
+    nav_font: HGDIOBJ,
+    small_font: HGDIOBJ,
+    section_font: HGDIOBJ,
+    width: i32,
+    height: i32,
+}
+
+impl PaintResources {
+    unsafe fn new(target_dc: *mut c_void, width: i32, height: i32) -> Self {
+        let dc = unsafe { CreateCompatibleDC(target_dc) };
+        let bitmap = unsafe { CreateCompatibleBitmap(target_dc, width, height) as HGDIOBJ };
+        let old_bitmap = unsafe { SelectObject(dc, bitmap) };
+        let scale = (width as f32 / BASE_WIDTH as f32)
+            .min(height as f32 / BASE_HEIGHT as f32)
+            .max(0.5);
+        let title_font = unsafe { create_ui_font_px((16.0 * scale) as i32, 500) };
+        let nav_font = unsafe { create_ui_font_px((14.0 * scale) as i32, FW_NORMAL as i32) };
+        let small_font = unsafe { create_ui_font_px((12.0 * scale) as i32, FW_NORMAL as i32) };
+        let section_font = unsafe { create_ui_font_px((17.0 * scale) as i32, 500) };
+        let old_font = unsafe { SelectObject(dc, title_font) };
+        let mut sidebar_selection_brush = null_mut();
+        unsafe { GdipCreateSolidFill(0x20ff_ffff, &mut sidebar_selection_brush) };
+        Self {
+            dc,
+            bitmap,
+            old_bitmap,
+            old_font,
+            fallback_brush: unsafe { CreateSolidBrush(rgb(27, 129, 193)) },
+            tool_selection_brush: unsafe { CreateSolidBrush(rgb(37, 159, 205)) },
+            sidebar_selection_brush,
+            title_font,
+            nav_font,
+            small_font,
+            section_font,
+            width,
+            height,
+        }
+    }
+}
+
+impl Drop for PaintResources {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old_font);
+            SelectObject(self.dc, self.old_bitmap);
+            DeleteObject(self.bitmap);
+            DeleteObject(self.fallback_brush as HGDIOBJ);
+            DeleteObject(self.tool_selection_brush as HGDIOBJ);
+            if !self.sidebar_selection_brush.is_null() {
+                GdipDeleteBrush(self.sidebar_selection_brush);
+            }
+            DeleteObject(self.title_font);
+            DeleteObject(self.nav_font);
+            DeleteObject(self.small_font);
+            DeleteObject(self.section_font);
+            DeleteDC(self.dc);
+        }
+    }
 }
 
 struct HardwareWindowState {
@@ -303,6 +388,7 @@ impl AppState {
         root: &Path,
         catalog: ToolCatalog,
         launcher: ToolLauncher,
+        hardware_rx: Receiver<HardwareSnapshot>,
     ) -> Result<Self, std::io::Error> {
         let config_path = root.join("Config.ini");
         let config = IniDocument::parse(&fs::read(&config_path)?).map_err(io_error)?;
@@ -335,6 +421,8 @@ impl AppState {
             hover: None,
             status: "硬件信息正在读取中…".to_owned(),
             hardware: HardwareState::Loading,
+            hardware_rx,
+            paint_resources: None,
         })
     }
 
@@ -430,7 +518,7 @@ impl AppState {
         unsafe { InvalidateRect(self.hwnd, null(), 0) };
     }
 
-    fn icon_for(&mut self, visible_index: usize) -> Option<*mut GpImage> {
+    fn icon_for(&mut self, visible_index: usize) -> Option<(*mut GpImage, u32, u32)> {
         let (category_index, tool_index) = *self.visible_tools.get(visible_index)?;
         let key = ((category_index as u64) << 32) | tool_index as u64;
         if !self.icon_cache.contains_key(&key) {
@@ -453,7 +541,9 @@ impl AppState {
                 self.icon_cache.insert(key, image);
             }
         }
-        self.icon_cache.get(&key).map(|image| image.image)
+        self.icon_cache
+            .get(&key)
+            .map(|image| (image.image, image.width, image.height))
     }
 
     fn logical_point(&self, x: i32, y: i32) -> (i32, i32) {
@@ -684,14 +774,10 @@ impl AppState {
     }
 
     unsafe fn load_hardware(&mut self) {
-        self.hardware = match collect_hardware_snapshot() {
-            Ok(snapshot) => HardwareState::Ready(snapshot),
-            Err(error) => HardwareState::Ready(HardwareSnapshot {
-                computer_name: "读取失败".to_owned(),
-                sections: Vec::new(),
-                warnings: vec![error.to_string()],
-            }),
+        let Ok(snapshot) = self.hardware_rx.try_recv() else {
+            return;
         };
+        self.hardware = HardwareState::Ready(snapshot);
         if matches!(self.current_page(), PageKind::Hardware) {
             self.status = "硬件信息（双击可查看完整报告）".to_owned();
         }
@@ -706,11 +792,23 @@ impl AppState {
         let sx = |value: i32| value * width / BASE_WIDTH;
         let sy = |value: i32| value * height / BASE_HEIGHT;
 
-        let buffer_dc = unsafe { CreateCompatibleDC(target_dc) };
-        let bitmap = unsafe { CreateCompatibleBitmap(target_dc, width, height) };
-        let old_bitmap = unsafe { SelectObject(buffer_dc, bitmap as HGDIOBJ) };
-        let fallback = unsafe { CreateSolidBrush(rgb(27, 129, 193)) };
-        unsafe { FillRect(buffer_dc, &client, fallback) };
+        let needs_resources = self
+            .paint_resources
+            .as_ref()
+            .is_none_or(|resources| resources.width != width || resources.height != height);
+        if needs_resources {
+            self.paint_resources = Some(unsafe { PaintResources::new(target_dc, width, height) });
+        }
+        let resources = self.paint_resources.as_ref().expect("paint resources");
+        let buffer_dc = resources.dc;
+        let fallback_brush = resources.fallback_brush;
+        let tool_selection_brush = resources.tool_selection_brush;
+        let sidebar_selection_brush = resources.sidebar_selection_brush;
+        let title_font = resources.title_font;
+        let nav_font = resources.nav_font;
+        let small_font = resources.small_font;
+        let section_font = resources.section_font;
+        unsafe { FillRect(buffer_dc, &client, fallback_brush) };
 
         let mut graphics = null_mut();
         if unsafe { GdipCreateFromHDC(buffer_dc, &mut graphics) } == 0 {
@@ -729,20 +827,16 @@ impl AppState {
                     );
                 }
             }
-            let mut selection_brush = null_mut();
-            if !self.settings_visible
-                && unsafe { GdipCreateSolidFill(0x20ff_ffff, &mut selection_brush) } == 0
-            {
+            if !self.settings_visible && !sidebar_selection_brush.is_null() {
                 unsafe {
                     GdipFillRectangleI(
                         graphics,
-                        selection_brush,
+                        sidebar_selection_brush,
                         0,
                         sy(SIDEBAR_TOP + self.active_sidebar as i32 * SIDEBAR_ROW_HEIGHT),
                         sx(SIDEBAR_WIDTH),
                         sy(SIDEBAR_ROW_HEIGHT),
                     );
-                    GdipDeleteBrush(selection_brush);
                 }
             }
 
@@ -769,7 +863,6 @@ impl AppState {
                     let cell_x = GRID_LEFT + column * GRID_CELL_WIDTH;
                     let cell_y = GRID_TOP + row * GRID_CELL_HEIGHT;
                     if self.selected_tool == Some(index) {
-                        let brush = unsafe { CreateSolidBrush(rgb(37, 159, 205)) };
                         let rect = scaled_rect(
                             cell_x + 3,
                             cell_y + 3,
@@ -779,17 +872,10 @@ impl AppState {
                             height,
                         );
                         unsafe {
-                            FillRect(buffer_dc, &rect, brush);
-                            DeleteObject(brush as HGDIOBJ);
+                            FillRect(buffer_dc, &rect, tool_selection_brush);
                         }
                     }
-                    if let Some(icon) = self.icon_for(index) {
-                        let mut icon_width = 32;
-                        let mut icon_height = 32;
-                        unsafe {
-                            GdipGetImageWidth(icon, &mut icon_width);
-                            GdipGetImageHeight(icon, &mut icon_height);
-                        }
+                    if let Some((icon, icon_width, icon_height)) = self.icon_for(index) {
                         let icon_width = icon_width.min(40) as i32;
                         let icon_height = icon_height.min(40) as i32;
                         unsafe {
@@ -809,16 +895,9 @@ impl AppState {
         }
 
         unsafe { SetBkMode(buffer_dc, TRANSPARENT as i32) };
-        let scale = (width as f32 / BASE_WIDTH as f32)
-            .min(height as f32 / BASE_HEIGHT as f32)
-            .max(0.5);
-        let title_font = unsafe { create_ui_font_px((16.0 * scale) as i32, 500) };
-        let nav_font = unsafe { create_ui_font_px((14.0 * scale) as i32, FW_NORMAL as i32) };
-        let small_font = unsafe { create_ui_font_px((12.0 * scale) as i32, FW_NORMAL as i32) };
-        let section_font = unsafe { create_ui_font_px((17.0 * scale) as i32, 500) };
 
         unsafe { SetTextColor(buffer_dc, rgb(255, 255, 255)) };
-        let old_font = unsafe { SelectObject(buffer_dc, title_font) };
+        unsafe { SelectObject(buffer_dc, title_font) };
         unsafe {
             draw_text(
                 buffer_dc,
@@ -873,17 +952,16 @@ impl AppState {
         match self.current_page() {
             PageKind::Tools(_) => {
                 unsafe { SelectObject(buffer_dc, small_font) };
-                let names = (0..self.visible_tools.len())
-                    .map(|index| self.tool_at(index).map(|tool| tool.name.clone()))
-                    .collect::<Vec<_>>();
-                for (index, name) in names.into_iter().enumerate() {
-                    let Some(name) = name else { continue };
+                for index in 0..self.visible_tools.len() {
+                    let Some(tool) = self.tool_at(index) else {
+                        continue;
+                    };
                     let column = (index % GRID_COLUMNS) as i32;
                     let row = (index / GRID_COLUMNS) as i32;
                     unsafe {
                         draw_text(
                             buffer_dc,
-                            &name,
+                            &tool.name,
                             scaled_rect(
                                 GRID_LEFT + column * GRID_CELL_WIDTH + 2,
                                 GRID_TOP + row * GRID_CELL_HEIGHT + 52,
@@ -907,15 +985,6 @@ impl AppState {
 
         unsafe {
             BitBlt(target_dc, 0, 0, width, height, buffer_dc, 0, 0, SRCCOPY);
-            SelectObject(buffer_dc, old_font);
-            SelectObject(buffer_dc, old_bitmap);
-            DeleteObject(bitmap as HGDIOBJ);
-            DeleteObject(fallback as HGDIOBJ);
-            DeleteObject(title_font);
-            DeleteObject(nav_font);
-            DeleteObject(small_font);
-            DeleteObject(section_font);
-            DeleteDC(buffer_dc);
         }
     }
 
@@ -1129,10 +1198,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let root = locate_package_root()?;
     let catalog = ToolCatalog::load(&root, PASSWORD)?;
     let launcher = ToolLauncher::new(&root)?;
+    let (hardware_tx, hardware_rx) = std::sync::mpsc::channel();
 
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let _gdiplus = GdiplusSession::start()?;
-    let mut state = Box::new(AppState::new(&root, catalog, launcher)?);
+    let mut state = Box::new(AppState::new(&root, catalog, launcher, hardware_rx)?);
 
     unsafe {
         let instance = GetModuleHandleW(null());
@@ -1180,7 +1250,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, app_icon as isize);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-        PostMessageW(hwnd, WM_LOAD_HARDWARE, 0, 0);
+        let hardware_hwnd = hwnd as usize;
+        std::thread::spawn(move || {
+            let snapshot = collect_hardware_snapshot().unwrap_or_else(|error| HardwareSnapshot {
+                computer_name: "读取失败".to_owned(),
+                sections: Vec::new(),
+                warnings: vec![error.to_string()],
+            });
+            if hardware_tx.send(snapshot).is_ok() {
+                PostMessageW(hardware_hwnd as HWND, WM_LOAD_HARDWARE, 0, 0);
+            }
+        });
 
         let mut message: MSG = zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
@@ -1243,7 +1323,6 @@ unsafe extern "system" fn window_proc(
                 if new_hover != unsafe { (*state).hover } {
                     unsafe {
                         (*state).hover = new_hover;
-                        InvalidateRect(hwnd, null(), 0);
                     }
                 }
                 let cursor = if new_hover.is_some() {
