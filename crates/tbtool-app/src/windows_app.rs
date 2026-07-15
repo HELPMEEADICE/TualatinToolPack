@@ -42,9 +42,10 @@ use windows_sys::Win32::{
             SW_MINIMIZE, SW_SHOW, SendMessageW, SetCursor, SetWindowLongPtrW, ShowWindow,
             TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
             WM_GETMINMAXINFO, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-            WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_SETICON, WM_SIZE, WNDCLASSW,
-            WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-            WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SIZE,
+            WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
+            WS_EX_CONTROLPARENT, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            WS_VSCROLL,
         },
     },
 };
@@ -281,7 +282,38 @@ impl AppSettings {
 
 enum HardwareState {
     Loading,
-    Ready(HardwareSnapshot),
+    Ready(HardwareView),
+}
+
+struct HardwareView {
+    snapshot: HardwareSnapshot,
+    model: String,
+    system: String,
+    details: String,
+    warning: Option<String>,
+}
+
+impl HardwareView {
+    fn new(snapshot: HardwareSnapshot) -> Self {
+        let model = hardware_name(&snapshot, HardwareCategory::System, "整机信息")
+            .unwrap_or_else(|| snapshot.computer_name.clone());
+        let system = hardware_name(&snapshot, HardwareCategory::System, "操作系统")
+            .unwrap_or_else(|| "Windows".to_owned());
+        let details = hardware_details(&snapshot);
+        let warning = (!snapshot.warnings.is_empty()).then(|| {
+            format!(
+                "检测提示：{} 项信息未能读取，双击查看完整报告。",
+                snapshot.warnings.len()
+            )
+        });
+        Self {
+            snapshot,
+            model,
+            system,
+            details,
+            warning,
+        }
+    }
 }
 
 struct AppState {
@@ -295,13 +327,18 @@ struct AppState {
     background: GdiImage,
     hardware_background: GdiImage,
     hardware_icons: Vec<GdiImage>,
-    icon_cache: HashMap<u64, GdiImage>,
+    icon_cache: HashMap<u64, Option<GdiImage>>,
     sidebar: Vec<SidebarItem>,
     active_sidebar: usize,
     settings_visible: bool,
     visible_tools: Vec<(usize, usize)>,
+    visible_tool_names: Vec<Vec<u16>>,
     selected_tool: Option<usize>,
     hover: Option<HitTarget>,
+    arrow_cursor: *mut c_void,
+    hand_cursor: *mut c_void,
+    client_width: i32,
+    client_height: i32,
     status: String,
     hardware: HardwareState,
     hardware_rx: Receiver<HardwareSnapshot>,
@@ -417,8 +454,13 @@ impl AppState {
             active_sidebar: 0,
             settings_visible: false,
             visible_tools: Vec::new(),
+            visible_tool_names: Vec::new(),
             selected_tool: None,
             hover: None,
+            arrow_cursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
+            hand_cursor: unsafe { LoadCursorW(null_mut(), IDC_HAND) },
+            client_width: BASE_WIDTH,
+            client_height: BASE_HEIGHT,
             status: "硬件信息正在读取中…".to_owned(),
             hardware: HardwareState::Loading,
             hardware_rx,
@@ -442,6 +484,7 @@ impl AppState {
         self.active_sidebar = index;
         self.selected_tool = None;
         self.visible_tools.clear();
+        self.visible_tool_names.clear();
         match self.sidebar[index].page.clone() {
             PageKind::Hardware => {
                 self.status = match self.hardware {
@@ -458,6 +501,15 @@ impl AppState {
                         );
                     }
                 }
+                self.visible_tool_names
+                    .extend(self.visible_tools.iter().filter_map(|&(category, tool)| {
+                        self.catalog
+                            .categories
+                            .get(category)?
+                            .tools
+                            .get(tool)
+                            .map(|tool| wide(&tool.name))
+                    }));
                 self.status = "提示：单击选择工具可查看工具说明，双击可启动工具。".to_owned();
             }
             PageKind::Settings => unreachable!("settings is opened from the title-bar menu"),
@@ -469,6 +521,7 @@ impl AppState {
         self.settings_visible = true;
         self.selected_tool = None;
         self.visible_tools.clear();
+        self.visible_tool_names.clear();
         self.status = "选项设置".to_owned();
         unsafe { InvalidateRect(self.hwnd, null(), 0) };
     }
@@ -522,7 +575,7 @@ impl AppState {
         let (category_index, tool_index) = *self.visible_tools.get(visible_index)?;
         let key = ((category_index as u64) << 32) | tool_index as u64;
         if !self.icon_cache.contains_key(&key) {
-            let bytes = self
+            let image = self
                 .catalog
                 .categories
                 .get(category_index)?
@@ -530,27 +583,25 @@ impl AppState {
                 .get(tool_index)
                 .map(|tool| {
                     if !tool.icon.is_empty() {
-                        tool.icon.clone()
+                        tool.icon.as_slice()
                     } else if !tool.icon_40.is_empty() {
-                        tool.icon_40.clone()
+                        tool.icon_40.as_slice()
                     } else {
-                        tool.icon_48.clone()
+                        tool.icon_48.as_slice()
                     }
-                })?;
-            if let Some(image) = GdiImage::from_bytes(&bytes) {
-                self.icon_cache.insert(key, image);
-            }
+                })
+                .and_then(GdiImage::from_bytes);
+            self.icon_cache.insert(key, image);
         }
         self.icon_cache
             .get(&key)
+            .and_then(Option::as_ref)
             .map(|image| (image.image, image.width, image.height))
     }
 
     fn logical_point(&self, x: i32, y: i32) -> (i32, i32) {
-        let mut rect: RECT = unsafe { zeroed() };
-        unsafe { GetClientRect(self.hwnd, &mut rect) };
-        let width = rect.right.max(1);
-        let height = rect.bottom.max(1);
+        let width = self.client_width.max(1);
+        let height = self.client_height.max(1);
         (x * BASE_WIDTH / width, y * BASE_HEIGHT / height)
     }
 
@@ -763,9 +814,9 @@ impl AppState {
         match self.hit_test(x, y) {
             Some(HitTarget::Tool(index)) => unsafe { self.activate_tool(index) },
             _ if matches!(self.current_page(), PageKind::Hardware) => {
-                if let HardwareState::Ready(snapshot) = &self.hardware {
+                if let HardwareState::Ready(view) = &self.hardware {
                     let _ = unsafe {
-                        show_report_window(self.hwnd, "硬件检测报告", snapshot.to_text())
+                        show_report_window(self.hwnd, "硬件检测报告", view.snapshot.to_text())
                     };
                 }
             }
@@ -777,7 +828,7 @@ impl AppState {
         let Ok(snapshot) = self.hardware_rx.try_recv() else {
             return;
         };
-        self.hardware = HardwareState::Ready(snapshot);
+        self.hardware = HardwareState::Ready(HardwareView::new(snapshot));
         if matches!(self.current_page(), PageKind::Hardware) {
             self.status = "硬件信息（双击可查看完整报告）".to_owned();
         }
@@ -789,6 +840,8 @@ impl AppState {
         unsafe { GetClientRect(self.hwnd, &mut client) };
         let width = client.right.max(1);
         let height = client.bottom.max(1);
+        self.client_width = width;
+        self.client_height = height;
         let sx = |value: i32| value * width / BASE_WIDTH;
         let sy = |value: i32| value * height / BASE_HEIGHT;
 
@@ -952,16 +1005,16 @@ impl AppState {
         match self.current_page() {
             PageKind::Tools(_) => {
                 unsafe { SelectObject(buffer_dc, small_font) };
-                for index in 0..self.visible_tools.len() {
-                    let Some(tool) = self.tool_at(index) else {
+                for (index, name) in self.visible_tool_names.iter().enumerate() {
+                    if index >= self.visible_tools.len() {
                         continue;
-                    };
+                    }
                     let column = (index % GRID_COLUMNS) as i32;
                     let row = (index / GRID_COLUMNS) as i32;
                     unsafe {
-                        draw_text(
+                        draw_text_wide(
                             buffer_dc,
-                            &tool.name,
+                            name,
                             scaled_rect(
                                 GRID_LEFT + column * GRID_CELL_WIDTH + 2,
                                 GRID_TOP + row * GRID_CELL_HEIGHT + 52,
@@ -997,7 +1050,7 @@ impl AppState {
         section_font: HGDIOBJ,
         small_font: HGDIOBJ,
     ) {
-        let HardwareState::Ready(snapshot) = &self.hardware else {
+        let HardwareState::Ready(view) = &self.hardware else {
             unsafe { SelectObject(dc, section_font) };
             unsafe {
                 draw_text(
@@ -1009,15 +1062,11 @@ impl AppState {
             };
             return;
         };
-        let model = hardware_name(snapshot, HardwareCategory::System, "整机信息")
-            .unwrap_or_else(|| snapshot.computer_name.clone());
-        let system = hardware_name(snapshot, HardwareCategory::System, "操作系统")
-            .unwrap_or_else(|| "Windows".to_owned());
         let uptime = uptime_text();
         let cards = [
-            ("型号信息", model),
-            ("系统信息", system),
-            ("运行时间", uptime),
+            ("型号信息", view.model.as_str()),
+            ("系统信息", view.system.as_str()),
+            ("运行时间", uptime.as_str()),
         ];
         for (index, (title, value)) in cards.into_iter().enumerate() {
             let x = 215 + index as i32 * 272;
@@ -1035,7 +1084,7 @@ impl AppState {
             unsafe {
                 draw_text(
                     dc,
-                    &value,
+                    value,
                     scaled_rect(x + 22, 116, 218, 40, width, height),
                     DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
                 )
@@ -1052,24 +1101,20 @@ impl AppState {
             )
         };
         unsafe { SelectObject(dc, font) };
-        let details = hardware_details(snapshot);
         unsafe {
             draw_text(
                 dc,
-                &details,
+                &view.details,
                 scaled_rect(248, 255, 730, 300, width, height),
                 DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
             )
         };
-        if !snapshot.warnings.is_empty() {
+        if let Some(warning) = &view.warning {
             unsafe { SelectObject(dc, small_font) };
             unsafe {
                 draw_text(
                     dc,
-                    &format!(
-                        "检测提示：{} 项信息未能读取，双击查看完整报告。",
-                        snapshot.warnings.len()
-                    ),
+                    warning,
                     scaled_rect(248, 548, 730, 22, width, height),
                     DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
                 )
@@ -1207,7 +1252,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let instance = GetModuleHandleW(null());
         let class_name = wide(CLASS_NAME);
-        let app_icon = LoadIconW(instance, 1usize as *const u16);
+        let app_icon = LoadIconW(instance, std::ptr::without_provenance(1));
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
@@ -1296,6 +1341,16 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_SIZE => {
+            if !state.is_null() {
+                let width = (lparam as u16) as i32;
+                let height = ((lparam >> 16) as u16) as i32;
+                if width > 0 && height > 0 {
+                    unsafe {
+                        (*state).client_width = width;
+                        (*state).client_height = height;
+                    }
+                }
+            }
             unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
@@ -1320,19 +1375,36 @@ unsafe extern "system" fn window_proc(
             if !state.is_null() {
                 let (x, y) = client_point(lparam);
                 let new_hover = unsafe { (*state).hit_test(x, y) };
+                let was_clickable = unsafe { (*state).hover.is_some() };
+                let is_clickable = new_hover.is_some();
                 if new_hover != unsafe { (*state).hover } {
                     unsafe {
                         (*state).hover = new_hover;
                     }
                 }
-                let cursor = if new_hover.is_some() {
-                    IDC_HAND
-                } else {
-                    IDC_ARROW
-                };
-                unsafe { SetCursor(LoadCursorW(null_mut(), cursor)) };
+                if was_clickable != is_clickable {
+                    let cursor = if is_clickable {
+                        unsafe { (*state).hand_cursor }
+                    } else {
+                        unsafe { (*state).arrow_cursor }
+                    };
+                    unsafe { SetCursor(cursor) };
+                }
             }
             0
+        }
+        WM_SETCURSOR => {
+            if !state.is_null() && signed_low_word(lparam) == HTCLIENT as i32 {
+                let cursor = if unsafe { (*state).hover.is_some() } {
+                    unsafe { (*state).hand_cursor }
+                } else {
+                    unsafe { (*state).arrow_cursor }
+                };
+                unsafe { SetCursor(cursor) };
+                1
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
         }
         WM_LBUTTONUP => {
             if !state.is_null() {
@@ -1566,6 +1638,10 @@ fn scaled_rect(
 
 unsafe fn draw_text(dc: *mut c_void, value: &str, mut rect: RECT, flags: u32) {
     let value = wide(value);
+    unsafe { DrawTextW(dc, value.as_ptr(), -1, &mut rect, flags) };
+}
+
+unsafe fn draw_text_wide(dc: *mut c_void, value: &[u16], mut rect: RECT, flags: u32) {
     unsafe { DrawTextW(dc, value.as_ptr(), -1, &mut rect, flags) };
 }
 
