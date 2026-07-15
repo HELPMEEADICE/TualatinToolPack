@@ -2,6 +2,17 @@
 fn main() {
     let mut resources = winres::WindowsResource::new();
     resources.set_icon("assets/icon.ico");
+    resources.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#,
+    );
     resources
         .compile()
         .expect("failed to compile Windows resources");
